@@ -7,23 +7,25 @@ Needs only Python 3 (standard library). Three steps:
               season and episode numbers plus the show's IMDb and TVDB IDs:
                 Show | S05E10 | Episode title | tt0108778 | 79168
               This file is useful on its own for any media server tool.
-  2. probe    Tries a few ways of sending ONE episode to MDBList and prints what the
-              API answers. Run it once, then use the format that says added or existing: 1.
-  3. upload   Sends everything in the resolved file to your MDBList list.
+  2. probe    Tests ways of adding ONE known episode to an EMPTY list, prints what really landed
+              in the list, and removes it again. Use the format whose result is correct.
+  3. upload   Sends everything in the resolved file to an EMPTY MDBList list, after checking
+              with one episode that the right one lands. Format G also needs a free TMDB key:
+                export TMDB_API_KEY=...
 
 Your MDBList API key goes in an environment variable, never on the command line:
 
   export MDBLIST_API_KEY=...        (from https://mdblist.com/preferences/)
 
 Examples:
-  python3 christmas_to_mdblist_0.3.0.py resolve lists/christmas.txt -o christmas_resolved.txt
-  python3 christmas_to_mdblist_0.3.0.py probe christmas_resolved.txt --list-id 12345
-  python3 christmas_to_mdblist_0.3.0.py upload christmas_resolved.txt --list-id 12345 --format D
-  python3 christmas_to_mdblist_0.3.0.py upload christmas_resolved.txt --list-id 12345 --shows-only
+  python3 christmas_to_mdblist_0.4.0.py resolve lists/christmas.txt -o christmas_resolved.txt
+  python3 christmas_to_mdblist_0.4.0.py probe christmas_resolved.txt --list-id 12345
+  python3 christmas_to_mdblist_0.4.0.py upload christmas_resolved.txt --list-id 12345 --format G
+  python3 christmas_to_mdblist_0.4.0.py upload christmas_resolved.txt --list-id 12345 --format shows
 """
 import argparse, difflib, json, os, re, sys, time, unicodedata, urllib.error, urllib.parse, urllib.request
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 UA = "silo-seasonal-lists-tool/" + VERSION
 TVMAZE = "https://api.tvmaze.com"
 MDBLIST = "https://api.mdblist.com"
@@ -246,66 +248,125 @@ def attach_tmdb_ids(rows, cache_path):
     return out
 
 
+def send(list_id, body, action="add"):
+    return http_json("%s/lists/%d/items/%s?apikey=%s" % (MDBLIST, list_id, action, mdb_key()), body)
+
+
+def list_items(list_id):
+    status, data = http_json("%s/lists/%d/items?apikey=%s&limit=1000" % (MDBLIST, list_id, mdb_key()))
+    if status != 200 or not isinstance(data, dict):
+        raise SystemExit("Could not read list %d: HTTP %s %s" % (list_id, status, str(data)[:200]))
+    return data
+
+
+def describe(data):
+    out = ["%s S%02dE%02d \"%s\" (show TMDB %s, episode id %s)" % (e.get("parent_title"), e.get("season_number") or 0, e.get("episode_number") or 0, e.get("title"), e.get("show_id"), e.get("id")) for e in data.get("episodes", [])]
+    out += ["WHOLE SHOW: %s" % sh.get("title") for sh in data.get("shows", [])]
+    out += ["MOVIE: %s" % m.get("title") for m in data.get("movies", [])]
+    return out
+
+
+def is_empty(data):
+    return not (data.get("episodes") or data.get("shows") or data.get("movies") or data.get("seasons"))
+
+
+TMDB_EPISODES = {}
+
+
+def tmdb_episode_id(show_tmdb, season, episode):
+    """TMDB's own episode id, needed by MDBList. Needs a free TMDB API key (v3) in TMDB_API_KEY."""
+    key = os.environ.get("TMDB_API_KEY")
+    if not key:
+        raise SystemExit("Set TMDB_API_KEY first (free, from themoviedb.org > Settings > API): export TMDB_API_KEY=...")
+    if (show_tmdb, season) not in TMDB_EPISODES:
+        status, data = http_json("https://api.themoviedb.org/3/tv/%s/season/%d?api_key=%s" % (show_tmdb, season, urllib.parse.quote(key)))
+        time.sleep(0.05)
+        TMDB_EPISODES[(show_tmdb, season)] = {e["episode_number"]: e["id"] for e in data.get("episodes", [])} if status == 200 and isinstance(data, dict) else {}
+    return TMDB_EPISODES[(show_tmdb, season)].get(episode)
+
+
 def body_for(fmt, rows):
-    """Candidate request bodies for episodes. Rows need a show TMDB id (see attach_tmdb_ids)."""
-    if fmt == "D":
-        return {"episodes": [{"tmdb": r["tmdb"], "season": r["season"], "episode": r["episode"]} for r in rows]}
-    if fmt == "E":
-        return {"episodes": [{"show": {"tmdb": r["tmdb"]}, "season": r["season"], "episode": r["episode"]} for r in rows]}
-    if fmt == "F":
-        return {"episodes": [{"show_id": r["tmdb"], "season_number": r["season"], "episode_number": r["episode"]} for r in rows]}
+    """fmt G: episodes by TMDB episode id (needs TMDB_API_KEY).  fmt H: show + season + episode."""
+    if fmt == "G":
+        ids = [tmdb_episode_id(r["tmdb"], r["season"], r["episode"]) for r in rows]
+        return {"episodes": [{"tmdb": i} for i in ids if i]}
+    if fmt == "H":
+        shows = {}
+        for r in rows:
+            shows.setdefault(r["tmdb"], {}).setdefault(r["season"], []).append({"episode": r["episode"]})
+        return {"shows": [{"tmdb": t, "seasons": [{"season": s, "episodes": e} for s, e in sorted(ss.items())]} for t, ss in shows.items()]}
     if fmt == "shows":
         return {"shows": [{"imdb": i} for i in dict.fromkeys(r["imdb"] for r in rows)]}
     raise SystemExit("unknown format " + fmt)
 
 
-def send(list_id, body):
-    url = "%s/lists/%d/items/add?apikey=%s" % (MDBLIST, list_id, mdb_key())
-    return http_json(url, body)
-
-
 def cmd_probe(a):
-    rows = attach_tmdb_ids(read_resolved(a.resolved), a.resolved + ".tmdb.json")
-    if not rows:
-        raise SystemExit("No usable rows (need season, episode and a show IMDb ID that MDBList knows).")
-    # Prefer an episode that is already in the list, so a correct format answers "existing: 1".
-    _, cur = http_json("%s/lists/%d/items?apikey=%s" % (MDBLIST, a.list_id, mdb_key()))
-    pick = rows[0]
-    for e in (cur or {}).get("episodes", []) if isinstance(cur, dict) else []:
-        for r in rows:
-            if r["season"] == e.get("season_number") and r["episode"] == e.get("episode_number") and norm(r["show"]) == norm(e.get("parent_title") or ""):
-                pick = r
-                break
-    print("Testing with: %s S%02dE%02d (show TMDB id %s)" % (pick["show"], pick["season"], pick["episode"], pick["tmdb"]))
-    for fmt in ("D", "E", "F"):
-        status, resp = send(a.list_id, body_for(fmt, [pick]))
-        print("format %s -> HTTP %s: %s" % (fmt, status, json.dumps(resp)[:300]))
-    print("\nUse the format whose answer shows an episode 'added' or 'existing' of 1, then:\n  upload %s --list-id %d --format <D|E|F>" % (a.resolved, a.list_id))
+    """Tests layouts with ONE known episode (Bob's Burgers S08E06) on an EMPTY list, shows what
+    actually landed in the list, then removes it again."""
+    if not is_empty(list_items(a.list_id)):
+        raise SystemExit("Use an EMPTY list for probe (it removes what it adds). List %d has items." % a.list_id)
+    tests = {
+        "G (episode by TMDB id)": {"episodes": [{"tmdb": 1404187}]},
+        "H (show + season + episode)": {"shows": [{"tmdb": 32726, "seasons": [{"season": 8, "episodes": [{"episode": 6}]}]}]},
+        "J (episode with show_tmdb)": {"episodes": [{"show_tmdb": 32726, "season": 8, "episode": 6}]},
+    }
+    print("Expected result: Bob's Burgers S08E06 \"The Bleakening (1)\" and nothing else\n")
+    for name, body in tests.items():
+        status, resp = send(a.list_id, body)
+        data = list_items(a.list_id)
+        print("format %s -> HTTP %s: %s" % (name, status, json.dumps(resp)[:200]))
+        print("   list now contains: %s" % (describe(data) or ["nothing"]))
+        send(a.list_id, body, "remove")
+        left = list_items(a.list_id)
+        if not is_empty(left):
+            print("   (could not remove it automatically; please clear the list on mdblist.com before the next test)")
+            break
+    print("\nA format is right only if its 'list now contains' line is exactly the Bob's Burgers episode.")
 
 
 def cmd_upload(a):
     rows = read_resolved(a.resolved)
-    fmt = "shows" if a.shows_only else a.format
-    if not fmt:
-        raise SystemExit("Choose --format D|E|F (run probe first) or --shows-only.")
-    if fmt != "shows":
+    if a.format != "shows":
         rows = attach_tmdb_ids(rows, a.resolved + ".tmdb.json")
-    if fmt == "shows":
+    if not is_empty(list_items(a.list_id)) and not a.allow_nonempty:
+        raise SystemExit("List %d is not empty. Use a new empty list (or add --allow-nonempty)." % a.list_id)
+    if a.format != "shows":
+        # Safety check: add one episode and confirm the right one landed before continuing.
+        r = rows[0]
+        body = body_for(a.format, [r])
+        if not body.get("episodes") and not body.get("shows"):
+            raise SystemExit("Could not build the first request (no TMDB episode id).")
+        send(a.list_id, body)
+        data = list_items(a.list_id)
+        ok = any(e.get("show_id") == r["tmdb"] and e.get("season_number") == r["season"] and e.get("episode_number") == r["episode"] for e in data.get("episodes", []))
+        if not ok or data.get("shows"):
+            send(a.list_id, body, "remove")
+            raise SystemExit("Safety check failed: after adding %s S%02dE%02d the list contained %s. Nothing else was sent; the test item was removed." % (r["show"], r["season"], r["episode"], describe(data)))
+        print("Safety check passed: %s" % describe(data)[0])
+    if a.format == "shows":
         shows = body_for("shows", rows)["shows"]
         batches = [{"shows": shows[i:i + 100]} for i in range(0, len(shows), 100)]
     else:
-        batches = [body_for(fmt, rows[i:i + 100]) for i in range(0, len(rows), 100)]
+        batches = []
+        for i in range(0, len(rows), 100):
+            b = body_for(a.format, rows[i:i + 100])
+            if b.get("episodes") or b.get("shows"):
+                batches.append(b)
     totals = {}
     for n, body in enumerate(batches, 1):
         status, resp = send(a.list_id, body)
-        print("batch %d/%d -> HTTP %s: %s" % (n, len(batches), status, json.dumps(resp)[:300]))
+        print("batch %d/%d -> HTTP %s" % (n, len(batches), status))
         if status != 200:
-            raise SystemExit("Stopping: MDBList refused this batch.")
+            raise SystemExit("Stopping: MDBList refused this batch: %s" % str(resp)[:300])
         for kind in ("added", "existing", "not_found"):
             for k, v in ((resp or {}).get(kind) or {}).items():
                 totals[(kind, k)] = totals.get((kind, k), 0) + v
         time.sleep(1)
     print("Totals: " + ", ".join("%s %s=%d" % (k[0], k[1], v) for k, v in sorted(totals.items()) if v))
+    data = list_items(a.list_id)
+    print("List now has %d episodes and %d whole shows. First few:" % (len(data.get("episodes", [])), len(data.get("shows", []))))
+    for line in describe(data)[:8]:
+        print("  " + line)
 
 
 def main():
@@ -321,8 +382,8 @@ def main():
     u = sub.add_parser("upload")
     u.add_argument("resolved")
     u.add_argument("--list-id", type=int, required=True)
-    u.add_argument("--format", choices=["D", "E", "F"])
-    u.add_argument("--shows-only", action="store_true")
+    u.add_argument("--format", choices=["G", "H", "shows"], required=True)
+    u.add_argument("--allow-nonempty", action="store_true")
     a = p.parse_args()
     {"resolve": cmd_resolve, "probe": cmd_probe, "upload": cmd_upload}[a.cmd](a)
 
