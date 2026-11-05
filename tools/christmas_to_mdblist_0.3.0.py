@@ -8,8 +8,7 @@ Needs only Python 3 (standard library). Three steps:
                 Show | S05E10 | Episode title | tt0108778 | 79168
               This file is useful on its own for any media server tool.
   2. probe    Tries a few ways of sending ONE episode to MDBList and prints what the
-              API answers, because MDBList's episode request format is not documented
-              anywhere I could read. Run it once, then use the format that says added: 1.
+              API answers. Run it once, then use the format that says added or existing: 1.
   3. upload   Sends everything in the resolved file to your MDBList list.
 
 Your MDBList API key goes in an environment variable, never on the command line:
@@ -17,14 +16,14 @@ Your MDBList API key goes in an environment variable, never on the command line:
   export MDBLIST_API_KEY=...        (from https://mdblist.com/preferences/)
 
 Examples:
-  python3 christmas_to_mdblist_0.2.0.py resolve lists/christmas.txt -o christmas_resolved.txt
-  python3 christmas_to_mdblist_0.2.0.py probe christmas_resolved.txt --list-id 12345
-  python3 christmas_to_mdblist_0.2.0.py upload christmas_resolved.txt --list-id 12345 --format B
-  python3 christmas_to_mdblist_0.2.0.py upload christmas_resolved.txt --list-id 12345 --shows-only
+  python3 christmas_to_mdblist_0.3.0.py resolve lists/christmas.txt -o christmas_resolved.txt
+  python3 christmas_to_mdblist_0.3.0.py probe christmas_resolved.txt --list-id 12345
+  python3 christmas_to_mdblist_0.3.0.py upload christmas_resolved.txt --list-id 12345 --format D
+  python3 christmas_to_mdblist_0.3.0.py upload christmas_resolved.txt --list-id 12345 --shows-only
 """
 import argparse, difflib, json, os, re, sys, time, unicodedata, urllib.error, urllib.parse, urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 UA = "silo-seasonal-lists-tool/" + VERSION
 TVMAZE = "https://api.tvmaze.com"
 MDBLIST = "https://api.mdblist.com"
@@ -208,59 +207,105 @@ def read_resolved(path):
     return rows
 
 
+def mdb_key():
+    key = os.environ.get("MDBLIST_API_KEY")
+    if not key:
+        raise SystemExit("Set MDBLIST_API_KEY first: export MDBLIST_API_KEY=...")
+    return urllib.parse.quote(key)
+
+
+def attach_tmdb_ids(rows, cache_path):
+    """MDBList identifies episodes through the show's TMDB id, which TVMaze does not give.
+    Ask MDBList to convert each show's IMDb (or TVDB) id to a TMDB id."""
+    cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}
+    wanted = {}
+    for r in rows:
+        key = "imdb:" + r["imdb"]
+        wanted[key] = ("imdb", r["imdb"])
+        r["_key"] = key
+    todo = [(k, v) for k, v in wanted.items() if k not in cache]
+    for i in range(0, len(todo), 50):
+        chunk = todo[i:i + 50]
+        status, resp = http_json("%s/imdb/show?apikey=%s" % (MDBLIST, mdb_key()), {"ids": [v[1] for _, v in chunk]})
+        found = {}
+        if status == 200 and isinstance(resp, list):
+            for info in resp:
+                ids = (info or {}).get("ids") or {}
+                if ids.get("imdb") and ids.get("tmdb"):
+                    found[ids["imdb"]] = ids["tmdb"]
+        for k, (_, imdb) in chunk:
+            cache[k] = found.get(imdb)
+        print("  looked up %d / %d shows" % (min(i + 50, len(todo)), len(todo)), file=sys.stderr)
+        time.sleep(1)
+    json.dump(cache, open(cache_path, "w"))
+    out = []
+    for r in rows:
+        t = cache.get(r["_key"])
+        if t:
+            out.append(dict(r, tmdb=t))
+    return out
+
+
 def body_for(fmt, rows):
-    """Candidate request bodies. MDBList documents movies and shows by IMDb/TMDB ID; the
-    episode layout below is a best guess, which is why `probe` exists."""
-    if fmt == "A":
-        return {"episodes": [{"imdb": r["imdb"], "season": r["season"], "episode": r["episode"]} for r in rows]}
-    if fmt == "B":
-        return {"episodes": [{"show": {"imdb": r["imdb"]}, "season": r["season"], "episode": r["episode"]} for r in rows]}
-    if fmt == "C":
-        shows = {}
-        for r in rows:
-            shows.setdefault(r["imdb"], {}).setdefault(r["season"], []).append({"episode": r["episode"]})
-        return {"shows": [{"imdb": i, "seasons": [{"season": s, "episodes": e} for s, e in sorted(ss.items())]} for i, ss in shows.items()]}
+    """Candidate request bodies for episodes. Rows need a show TMDB id (see attach_tmdb_ids)."""
+    if fmt == "D":
+        return {"episodes": [{"tmdb": r["tmdb"], "season": r["season"], "episode": r["episode"]} for r in rows]}
+    if fmt == "E":
+        return {"episodes": [{"show": {"tmdb": r["tmdb"]}, "season": r["season"], "episode": r["episode"]} for r in rows]}
+    if fmt == "F":
+        return {"episodes": [{"show_id": r["tmdb"], "season_number": r["season"], "episode_number": r["episode"]} for r in rows]}
     if fmt == "shows":
         return {"shows": [{"imdb": i} for i in dict.fromkeys(r["imdb"] for r in rows)]}
     raise SystemExit("unknown format " + fmt)
 
 
 def send(list_id, body):
-    key = os.environ.get("MDBLIST_API_KEY")
-    if not key:
-        raise SystemExit("Set MDBLIST_API_KEY first: export MDBLIST_API_KEY=...")
-    url = "%s/lists/%d/items/add?apikey=%s" % (MDBLIST, list_id, urllib.parse.quote(key))
+    url = "%s/lists/%d/items/add?apikey=%s" % (MDBLIST, list_id, mdb_key())
     return http_json(url, body)
 
 
 def cmd_probe(a):
-    rows = read_resolved(a.resolved)
+    rows = attach_tmdb_ids(read_resolved(a.resolved), a.resolved + ".tmdb.json")
     if not rows:
-        raise SystemExit("No usable rows (need season, episode and a show IMDb ID).")
-    one = rows[:1]
-    print("Testing with: %s S%02dE%02d" % (one[0]["show"], one[0]["season"], one[0]["episode"]))
-    for fmt in ("A", "B", "C"):
-        status, resp = send(a.list_id, body_for(fmt, one))
+        raise SystemExit("No usable rows (need season, episode and a show IMDb ID that MDBList knows).")
+    # Prefer an episode that is already in the list, so a correct format answers "existing: 1".
+    _, cur = http_json("%s/lists/%d/items?apikey=%s" % (MDBLIST, a.list_id, mdb_key()))
+    pick = rows[0]
+    for e in (cur or {}).get("episodes", []) if isinstance(cur, dict) else []:
+        for r in rows:
+            if r["season"] == e.get("season_number") and r["episode"] == e.get("episode_number") and norm(r["show"]) == norm(e.get("parent_title") or ""):
+                pick = r
+                break
+    print("Testing with: %s S%02dE%02d (show TMDB id %s)" % (pick["show"], pick["season"], pick["episode"], pick["tmdb"]))
+    for fmt in ("D", "E", "F"):
+        status, resp = send(a.list_id, body_for(fmt, [pick]))
         print("format %s -> HTTP %s: %s" % (fmt, status, json.dumps(resp)[:300]))
-    print("\nUse the format whose answer shows an episode (or season) 'added' or 'existing' of 1, then:\n  upload %s --list-id %d --format <A|B|C>" % (a.resolved, a.list_id))
+    print("\nUse the format whose answer shows an episode 'added' or 'existing' of 1, then:\n  upload %s --list-id %d --format <D|E|F>" % (a.resolved, a.list_id))
 
 
 def cmd_upload(a):
     rows = read_resolved(a.resolved)
     fmt = "shows" if a.shows_only else a.format
     if not fmt:
-        raise SystemExit("Choose --format A|B|C (run probe first) or --shows-only.")
+        raise SystemExit("Choose --format D|E|F (run probe first) or --shows-only.")
+    if fmt != "shows":
+        rows = attach_tmdb_ids(rows, a.resolved + ".tmdb.json")
     if fmt == "shows":
-        batches = [body_for("shows", rows)]
-        batches = [{"shows": batches[0]["shows"][i:i + 100]} for i in range(0, len(batches[0]["shows"]), 100)]
+        shows = body_for("shows", rows)["shows"]
+        batches = [{"shows": shows[i:i + 100]} for i in range(0, len(shows), 100)]
     else:
         batches = [body_for(fmt, rows[i:i + 100]) for i in range(0, len(rows), 100)]
+    totals = {}
     for n, body in enumerate(batches, 1):
         status, resp = send(a.list_id, body)
         print("batch %d/%d -> HTTP %s: %s" % (n, len(batches), status, json.dumps(resp)[:300]))
         if status != 200:
             raise SystemExit("Stopping: MDBList refused this batch.")
+        for kind in ("added", "existing", "not_found"):
+            for k, v in ((resp or {}).get(kind) or {}).items():
+                totals[(kind, k)] = totals.get((kind, k), 0) + v
         time.sleep(1)
+    print("Totals: " + ", ".join("%s %s=%d" % (k[0], k[1], v) for k, v in sorted(totals.items()) if v))
 
 
 def main():
@@ -276,7 +321,7 @@ def main():
     u = sub.add_parser("upload")
     u.add_argument("resolved")
     u.add_argument("--list-id", type=int, required=True)
-    u.add_argument("--format", choices=["A", "B", "C"])
+    u.add_argument("--format", choices=["D", "E", "F"])
     u.add_argument("--shows-only", action="store_true")
     a = p.parse_args()
     {"resolve": cmd_resolve, "probe": cmd_probe, "upload": cmd_upload}[a.cmd](a)
