@@ -18,14 +18,14 @@ Your MDBList API key goes in an environment variable, never on the command line:
   export MDBLIST_API_KEY=...        (from https://mdblist.com/preferences/)
 
 Examples:
-  python3 christmas_to_mdblist_0.4.0.py resolve lists/christmas.txt -o christmas_resolved.txt
-  python3 christmas_to_mdblist_0.4.0.py probe christmas_resolved.txt --list-id 12345
-  python3 christmas_to_mdblist_0.4.0.py upload christmas_resolved.txt --list-id 12345 --format G
-  python3 christmas_to_mdblist_0.4.0.py upload christmas_resolved.txt --list-id 12345 --format shows
+  python3 christmas_to_mdblist_0.4.1.py resolve lists/christmas.txt -o christmas_resolved.txt
+  python3 christmas_to_mdblist_0.4.1.py probe christmas_resolved.txt --list-id 12345
+  python3 christmas_to_mdblist_0.4.1.py upload christmas_resolved.txt --list-id 12345 --format G
+  python3 christmas_to_mdblist_0.4.1.py upload christmas_resolved.txt --list-id 12345 --format shows
 """
 import argparse, difflib, json, os, re, sys, time, unicodedata, urllib.error, urllib.parse, urllib.request
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 UA = "silo-seasonal-lists-tool/" + VERSION
 TVMAZE = "https://api.tvmaze.com"
 MDBLIST = "https://api.mdblist.com"
@@ -237,7 +237,7 @@ def attach_tmdb_ids(rows, cache_path):
                     found[ids["imdb"]] = ids["tmdb"]
         for k, (_, imdb) in chunk:
             cache[k] = found.get(imdb)
-        print("  looked up %d / %d shows" % (min(i + 50, len(todo)), len(todo)), file=sys.stderr)
+        print("  MDBList show lookup: %d / %d" % (min(i + 50, len(todo)), len(todo)), flush=True)
         time.sleep(1)
     json.dump(cache, open(cache_path, "w"))
     out = []
@@ -271,6 +271,7 @@ def is_empty(data):
 
 
 TMDB_EPISODES = {}
+TMDB_WARNED = set()
 
 
 def tmdb_episode_id(show_tmdb, season, episode):
@@ -281,6 +282,14 @@ def tmdb_episode_id(show_tmdb, season, episode):
     if (show_tmdb, season) not in TMDB_EPISODES:
         status, data = http_json("https://api.themoviedb.org/3/tv/%s/season/%d?api_key=%s" % (show_tmdb, season, urllib.parse.quote(key)))
         time.sleep(0.05)
+        if status == 401:
+            raise SystemExit("TMDB refused the API key (HTTP 401). Check TMDB_API_KEY is the v3 'API Key', not the read access token.")
+        if status not in (200, 404) and status not in TMDB_WARNED:
+            TMDB_WARNED.add(status)
+            print("  warning: TMDB answered HTTP %s for some lookups" % status, flush=True)
+        n = len(TMDB_EPISODES) + 1
+        if n % 25 == 0:
+            print("  TMDB lookups: %d shows/seasons done" % n, flush=True)
         TMDB_EPISODES[(show_tmdb, season)] = {e["episode_number"]: e["id"] for e in data.get("episodes", [])} if status == 200 and isinstance(data, dict) else {}
     return TMDB_EPISODES[(show_tmdb, season)].get(episode)
 
@@ -348,8 +357,10 @@ def cmd_upload(a):
         batches = [{"shows": shows[i:i + 100]} for i in range(0, len(shows), 100)]
     else:
         batches = []
+        print("Looking up TMDB episode ids for %d episodes (this is the slow part)..." % len(rows), flush=True)
         for i in range(0, len(rows), 100):
             b = body_for(a.format, rows[i:i + 100])
+            print("  prepared batch %d/%d (%d episodes found on TMDB)" % (i // 100 + 1, (len(rows) + 99) // 100, len(b.get("episodes", []))), flush=True)
             if b.get("episodes") or b.get("shows"):
                 batches.append(b)
     totals = {}
