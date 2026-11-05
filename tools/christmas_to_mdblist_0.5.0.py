@@ -17,15 +17,18 @@ Your MDBList API key goes in an environment variable, never on the command line:
 
   export MDBLIST_API_KEY=...        (from https://mdblist.com/preferences/)
 
+  4. check    Compares the resolved file with the list and explains every missing row.
+
 Examples:
-  python3 christmas_to_mdblist_0.4.1.py resolve lists/christmas.txt -o christmas_resolved.txt
-  python3 christmas_to_mdblist_0.4.1.py probe christmas_resolved.txt --list-id 12345
-  python3 christmas_to_mdblist_0.4.1.py upload christmas_resolved.txt --list-id 12345 --format G
-  python3 christmas_to_mdblist_0.4.1.py upload christmas_resolved.txt --list-id 12345 --format shows
+  python3 christmas_to_mdblist_0.5.0.py check christmas_resolved.txt --list-id 12345
+  python3 christmas_to_mdblist_0.5.0.py resolve lists/christmas.txt -o christmas_resolved.txt
+  python3 christmas_to_mdblist_0.5.0.py probe christmas_resolved.txt --list-id 12345
+  python3 christmas_to_mdblist_0.5.0.py upload christmas_resolved.txt --list-id 12345 --format G
+  python3 christmas_to_mdblist_0.5.0.py upload christmas_resolved.txt --list-id 12345 --format shows
 """
 import argparse, difflib, json, os, re, sys, time, unicodedata, urllib.error, urllib.parse, urllib.request
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 UA = "silo-seasonal-lists-tool/" + VERSION
 TVMAZE = "https://api.tvmaze.com"
 MDBLIST = "https://api.mdblist.com"
@@ -225,7 +228,7 @@ def attach_tmdb_ids(rows, cache_path):
         key = "imdb:" + r["imdb"]
         wanted[key] = ("imdb", r["imdb"])
         r["_key"] = key
-    todo = [(k, v) for k, v in wanted.items() if k not in cache]
+    todo = [(k, v) for k, v in wanted.items() if not cache.get(k)]  # retry earlier misses
     for i in range(0, len(todo), 50):
         chunk = todo[i:i + 50]
         status, resp = http_json("%s/imdb/show?apikey=%s" % (MDBLIST, mdb_key()), {"ids": [v[1] for _, v in chunk]})
@@ -235,11 +238,17 @@ def attach_tmdb_ids(rows, cache_path):
                 ids = (info or {}).get("ids") or {}
                 if ids.get("imdb") and ids.get("tmdb"):
                     found[ids["imdb"]] = ids["tmdb"]
+        if status != 200:
+            print("  warning: MDBList show lookup failed (HTTP %s); these will be retried next run" % status, flush=True)
+            continue
         for k, (_, imdb) in chunk:
             cache[k] = found.get(imdb)
         print("  MDBList show lookup: %d / %d" % (min(i + 50, len(todo)), len(todo)), flush=True)
         time.sleep(1)
     json.dump(cache, open(cache_path, "w"))
+    unknown = sorted({r["show"] for r in rows if not cache.get(r["_key"])})
+    if unknown:
+        print("MDBList could not give a TMDB id for %d shows: %s" % (len(unknown), ", ".join(unknown[:15]) + (" ..." if len(unknown) > 15 else "")), flush=True)
     out = []
     for r in rows:
         t = cache.get(r["_key"])
@@ -252,11 +261,26 @@ def send(list_id, body, action="add"):
     return http_json("%s/lists/%d/items/%s?apikey=%s" % (MDBLIST, list_id, action, mdb_key()), body)
 
 
-def list_items(list_id):
-    status, data = http_json("%s/lists/%d/items?apikey=%s&limit=1000" % (MDBLIST, list_id, mdb_key()))
+def list_items(list_id, offset=0):
+    status, data = http_json("%s/lists/%d/items?apikey=%s&limit=1000&offset=%d" % (MDBLIST, list_id, mdb_key(), offset))
     if status != 200 or not isinstance(data, dict):
         raise SystemExit("Could not read list %d: HTTP %s %s" % (list_id, status, str(data)[:200]))
     return data
+
+
+def list_all(list_id):
+    """Every item in the list, following MDBList's paging (1000 per page)."""
+    out = {"episodes": [], "shows": [], "movies": [], "seasons": []}
+    offset = 0
+    while True:
+        data = list_items(list_id, offset)
+        for k in out:
+            out[k] += data.get(k) or []
+        pg = data.get("pagination") or {}
+        if not pg.get("has_more"):
+            return out
+        offset += int(pg.get("limit") or 1000)
+        print("  read %d items so far..." % sum(len(v) for v in out.values()), flush=True)
 
 
 def describe(data):
@@ -280,8 +304,12 @@ def tmdb_episode_id(show_tmdb, season, episode):
     if not key:
         raise SystemExit("Set TMDB_API_KEY first (free, from themoviedb.org > Settings > API): export TMDB_API_KEY=...")
     if (show_tmdb, season) not in TMDB_EPISODES:
-        status, data = http_json("https://api.themoviedb.org/3/tv/%s/season/%d?api_key=%s" % (show_tmdb, season, urllib.parse.quote(key)))
-        time.sleep(0.05)
+        for attempt in range(4):
+            status, data = http_json("https://api.themoviedb.org/3/tv/%s/season/%d?api_key=%s" % (show_tmdb, season, urllib.parse.quote(key)))
+            time.sleep(0.1)
+            if status in (200, 404):
+                break
+            time.sleep(2 * (attempt + 1))
         if status == 401:
             raise SystemExit("TMDB refused the API key (HTTP 401). Check TMDB_API_KEY is the v3 'API Key', not the read access token.")
         if status not in (200, 404) and status not in TMDB_WARNED:
@@ -290,15 +318,28 @@ def tmdb_episode_id(show_tmdb, season, episode):
         n = len(TMDB_EPISODES) + 1
         if n % 25 == 0:
             print("  TMDB lookups: %d shows/seasons done" % n, flush=True)
+        if status not in (200, 404):
+            return "error"  # not cached, so a later call can try again
         TMDB_EPISODES[(show_tmdb, season)] = {e["episode_number"]: e["id"] for e in data.get("episodes", [])} if status == 200 and isinstance(data, dict) else {}
     return TMDB_EPISODES[(show_tmdb, season)].get(episode)
+
+
+SKIPPED = {"no_tmdb_episode": [], "tmdb_error": []}
 
 
 def body_for(fmt, rows):
     """fmt G: episodes by TMDB episode id (needs TMDB_API_KEY).  fmt H: show + season + episode."""
     if fmt == "G":
-        ids = [tmdb_episode_id(r["tmdb"], r["season"], r["episode"]) for r in rows]
-        return {"episodes": [{"tmdb": i} for i in ids if i]}
+        ids = []
+        for r in rows:
+            i = tmdb_episode_id(r["tmdb"], r["season"], r["episode"])
+            if i == "error":
+                SKIPPED["tmdb_error"].append(r)
+            elif not i:
+                SKIPPED["no_tmdb_episode"].append(r)
+            else:
+                ids.append(i)
+        return {"episodes": [{"tmdb": i} for i in ids]}
     if fmt == "H":
         shows = {}
         for r in rows:
@@ -374,10 +415,46 @@ def cmd_upload(a):
                 totals[(kind, k)] = totals.get((kind, k), 0) + v
         time.sleep(1)
     print("Totals: " + ", ".join("%s %s=%d" % (k[0], k[1], v) for k, v in sorted(totals.items()) if v))
-    data = list_items(a.list_id)
+    for key, label in (("no_tmdb_episode", "TMDB has no such season/episode"), ("tmdb_error", "TMDB lookup failed (re-run with --allow-nonempty to retry)")):
+        if SKIPPED[key]:
+            print("Skipped %d rows: %s. Shows: %s" % (len(SKIPPED[key]), label, ", ".join(sorted({r["show"] for r in SKIPPED[key]})[:15])))
+    print("Reading the whole list back to count it...", flush=True)
+    data = list_all(a.list_id)
     print("List now has %d episodes and %d whole shows. First few:" % (len(data.get("episodes", [])), len(data.get("shows", []))))
     for line in describe(data)[:8]:
         print("  " + line)
+
+
+def cmd_check(a):
+    """Compare the resolved file with the list and explain every row that is missing."""
+    rows = read_resolved(a.resolved)
+    print("Reading list %d..." % a.list_id, flush=True)
+    data = list_all(a.list_id)
+    have = {(e.get("show_id"), e.get("season_number"), e.get("episode_number")) for e in data["episodes"]}
+    print("List holds %d episodes. Checking %d rows (cached lookups are used)..." % (len(data["episodes"]), len(rows)), flush=True)
+    cache_path = a.resolved + ".tmdb.json"
+    cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}
+    reasons = {}
+    for r in rows:
+        tm = cache.get("imdb:" + r["imdb"]) if r["imdb"] else None
+        if not r["imdb"]:
+            why = "show has no IMDb id in TVMaze"
+        elif not tm:
+            why = "MDBList gave no TMDB id for the show (or lookup never ran)"
+        elif (tm, r["season"], r["episode"]) in have:
+            continue
+        else:
+            eid = tmdb_episode_id(tm, r["season"], r["episode"]) if os.environ.get("TMDB_API_KEY") else None
+            why = ("TMDB has no such season/episode" if eid is None and os.environ.get("TMDB_API_KEY") else
+                   "TMDB lookup failed" if eid == "error" else
+                   "TMDB has it but it is not in the list" if eid else "not checked (set TMDB_API_KEY to learn why)")
+        reasons.setdefault(why, {}).setdefault(r["show"], []).append("S%02dE%02d" % (r["season"], r["episode"]))
+    total = sum(len(v) for d in reasons.values() for v in d.values())
+    print("\n%d of %d rows are not in the list." % (total, len(rows)))
+    for why, shows in sorted(reasons.items(), key=lambda kv: -sum(len(v) for v in kv[1].values())):
+        print("\n%s: %d rows" % (why, sum(len(v) for v in shows.values())))
+        for show, eps in sorted(shows.items(), key=lambda kv: -len(kv[1]))[:12]:
+            print("   %s (%s)" % (show, ", ".join(eps[:6]) + (" ..." if len(eps) > 6 else "")))
 
 
 def main():
@@ -390,13 +467,16 @@ def main():
     pr = sub.add_parser("probe")
     pr.add_argument("resolved")
     pr.add_argument("--list-id", type=int, required=True)
+    c = sub.add_parser("check")
+    c.add_argument("resolved")
+    c.add_argument("--list-id", type=int, required=True)
     u = sub.add_parser("upload")
     u.add_argument("resolved")
     u.add_argument("--list-id", type=int, required=True)
     u.add_argument("--format", choices=["G", "H", "shows"], required=True)
     u.add_argument("--allow-nonempty", action="store_true")
     a = p.parse_args()
-    {"resolve": cmd_resolve, "probe": cmd_probe, "upload": cmd_upload}[a.cmd](a)
+    {"resolve": cmd_resolve, "probe": cmd_probe, "upload": cmd_upload, "check": cmd_check}[a.cmd](a)
 
 
 if __name__ == "__main__":
