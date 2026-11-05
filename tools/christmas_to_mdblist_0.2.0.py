@@ -17,14 +17,14 @@ Your MDBList API key goes in an environment variable, never on the command line:
   export MDBLIST_API_KEY=...        (from https://mdblist.com/preferences/)
 
 Examples:
-  python3 christmas_to_mdblist_0.1.0.py resolve lists/christmas.txt -o christmas_resolved.txt
-  python3 christmas_to_mdblist_0.1.0.py probe christmas_resolved.txt --list-id 12345
-  python3 christmas_to_mdblist_0.1.0.py upload christmas_resolved.txt --list-id 12345 --format B
-  python3 christmas_to_mdblist_0.1.0.py upload christmas_resolved.txt --list-id 12345 --shows-only
+  python3 christmas_to_mdblist_0.2.0.py resolve lists/christmas.txt -o christmas_resolved.txt
+  python3 christmas_to_mdblist_0.2.0.py probe christmas_resolved.txt --list-id 12345
+  python3 christmas_to_mdblist_0.2.0.py upload christmas_resolved.txt --list-id 12345 --format B
+  python3 christmas_to_mdblist_0.2.0.py upload christmas_resolved.txt --list-id 12345 --shows-only
 """
-import argparse, json, os, re, sys, time, unicodedata, urllib.error, urllib.parse, urllib.request
+import argparse, difflib, json, os, re, sys, time, unicodedata, urllib.error, urllib.parse, urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 UA = "silo-seasonal-lists-tool/" + VERSION
 TVMAZE = "https://api.tvmaze.com"
 MDBLIST = "https://api.mdblist.com"
@@ -53,7 +53,7 @@ def http_json(url, body=None, retries=4):
 
 
 def norm(s):
-    s = unicodedata.normalize("NFKD", s).lower()
+    s = unicodedata.normalize("NFKD", s).lower().replace("&", " and ")
     s = re.sub(r"[^a-z0-9 ]", "", s)
     words = s.split()
     if len(words) > 1 and words[0] in ("the", "a", "an"):
@@ -82,86 +82,118 @@ def split_show(name):
     return name[:m.start()].strip(), int(year.group(0)) if year else None
 
 
-def pick_show(results, base, year, reboot):
-    want = norm(base)
-    best, best_score = None, -1
-    for r in results:
-        s = r["show"]
-        if norm(s.get("name") or "") != want:
-            continue
-        prem = (s.get("premiered") or "")[:4]
-        score = 1
-        if year and prem == str(year):
-            score += 10
-        if reboot and prem and int(prem) >= 2010:
-            score += 5
-        score += r.get("score", 0) / 100.0
-        if score > best_score:
-            best, best_score = s, score
-    return best
-
-
-def find_show(name, cache):
-    key = "show:" + name
-    if key in cache:
-        return cache[key]
+def candidates(name, cache):
+    """TVMaze shows that could be the one meant: exact name first, then similar names."""
     base, year = split_show(name)
-    reboot = "reboot" in name.lower()
-    _, res = http_json("%s/search/shows?q=%s" % (TVMAZE, urllib.parse.quote(base)))
-    time.sleep(0.6)
-    show = pick_show(res, base, year, reboot) if isinstance(res, list) else None
-    if show is None and norm(base).startswith("the") is False:
-        _, res = http_json("%s/search/shows?q=%s" % (TVMAZE, urllib.parse.quote("The " + base)))
-        time.sleep(0.6)
-        show = pick_show(res, "The " + base, year, reboot) if isinstance(res, list) else None
-    info = None
-    if show:
-        ext = show.get("externals") or {}
+    want = norm(base)
+    seen, out = set(), []
+    queries = [base, "The " + base if not want.startswith("the") else base[4:]]
+    head = re.split(r"[,:(]| aka ", base)[0].strip()
+    if head and head != base:
+        queries.append(head)
+    for q in queries:
+        key = "q2:" + q.lower()
+        if key not in cache:
+            _, res = http_json("%s/search/shows?q=%s" % (TVMAZE, urllib.parse.quote(q)))
+            cache[key] = res if isinstance(res, list) else []
+            time.sleep(0.6)
+        for r in cache[key]:
+            sh = r["show"]
+            n = norm(sh.get("name") or "")
+            exact = n == want
+            similar = len(want) >= 5 and (want in n or n in want) and min(len(n), len(want)) >= 0.5 * max(len(n), len(want))
+            if sh["id"] in seen or not (exact or similar):
+                continue
+            seen.add(sh["id"])
+            prem = (sh.get("premiered") or "")[:4]
+            rank = (2 if exact else 0) + (3 if year and prem == str(year) else 0) + r.get("score", 0) / 100.0
+            out.append((rank, exact, sh))
+        if any(e for _, e, _ in out):
+            break
+    out.sort(key=lambda t: -t[0])
+    return out[:4]
+
+
+def episodes_of(show, cache):
+    key = "eps2:%d" % show["id"]
+    if key not in cache:
         _, eps = http_json("%s/shows/%d/episodes?specials=1" % (TVMAZE, show["id"]))
         time.sleep(0.6)
-        info = {"name": show["name"], "imdb": ext.get("imdb"), "tvdb": ext.get("thetvdb"),
-                "episodes": [[e["season"], e["number"], e["name"]] for e in (eps or []) if e.get("number")]}
-    cache[key] = info
-    return info
+        cache[key] = [[e["season"], e["number"], e["name"]] for e in (eps or []) if isinstance(e, dict) and e.get("number")]
+    return cache[key]
 
 
-def match_episode(info, title):
-    want = norm(title)
-    parts = [norm(p) for p in title.split("/")] if "/" in title else []
-    for s, n, name in info["episodes"]:
-        if norm(name) == want or (parts and norm(name) in parts):
+def title_equal(a, b):
+    a, b = norm(a), norm(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    if len(short) >= 10 and short in long_ and len(short) >= 0.8 * len(long_):
+        return True
+    return len(short) >= 8 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.92
+
+
+def match_episode(eps, title):
+    parts = [p for p in title.split("/")] if "/" in title else []
+    for s, n, name in eps:
+        if title_equal(name, title) or any(title_equal(name, p) for p in parts):
             return s, n, name
     return None
+
+
+def pick_show(name, titles, cache):
+    """Choose the TVMaze show whose episodes match the most list titles for this show name.
+    This separates a show from its revival or remake (Doctor Who, Scrubs, Ghosts)."""
+    best = None
+    for rank, exact, show in candidates(name, cache):
+        eps = episodes_of(show, cache)
+        hits = sum(1 for t in titles if match_episode(eps, t))
+        if not exact and hits == 0:
+            continue  # a similar name is only trusted when its episodes agree
+        score = hits * 100 + rank
+        if best is None or score > best[0]:
+            best = (score, show, eps, hits)
+        if exact and titles and hits >= 0.8 * len(titles):
+            break
+    return best
 
 
 def cmd_resolve(a):
     cache_path = a.output + ".cache.json"
     cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}
     entries = parse_list(a.list)
-    rows, missed_show, missed_ep = [], [], []
-    for i, (show, title) in enumerate(entries, 1):
-        m = re.fullmatch(r"[sS](\d+)[eE](\d+)(?:\s*\|\s*(.*))?", title)
-        info = find_show(show, cache)
-        if i % 25 == 0:
+    by_show = {}
+    for show, title in entries:
+        by_show.setdefault(show, []).append(title)
+    chosen = {}
+    for i, (show, titles) in enumerate(by_show.items(), 1):
+        plain = [t for t in titles if not re.match(r"[sS]\d+[eE]\d+", t)]
+        chosen[show] = pick_show(show, plain, cache)
+        if i % 20 == 0:
             json.dump(cache, open(cache_path, "w"))
-            print("  %d / %d lines" % (i, len(entries)), file=sys.stderr)
-        if not info:
+            print("  %d / %d shows" % (i, len(by_show)), file=sys.stderr)
+    json.dump(cache, open(cache_path, "w"))
+    rows, missed_show, missed_ep = [], [], []
+    for show, title in entries:
+        pick = chosen[show]
+        if not pick:
             missed_show.append("%s | %s" % (show, title))
             continue
-        if m:
-            found = (int(m.group(1)), int(m.group(2)), m.group(3) or "")
-        else:
-            found = match_episode(info, title)
+        _, sh, eps, _ = pick
+        m = re.fullmatch(r"[sS](\d+)[eE](\d+)(?:\s*\|\s*(.*))?", title)
+        found = (int(m.group(1)), int(m.group(2)), m.group(3) or "") if m else match_episode(eps, title)
         if not found:
-            missed_ep.append("%s | %s" % (show, title))
+            missed_ep.append("%s | %s   [TVMaze show used: %s, %d episodes]" % (show, title, sh["name"], len(eps)))
             continue
-        rows.append("%s | S%02dE%02d | %s | %s | %s" % (show, found[0], found[1], found[2] or title, info["imdb"] or "", info["tvdb"] or ""))
-    json.dump(cache, open(cache_path, "w"))
+        ext = sh.get("externals") or {}
+        rows.append("%s | S%02dE%02d | %s | %s | %s" % (show, found[0], found[1], found[2] or title, ext.get("imdb") or "", ext.get("thetvdb") or ""))
     with open(a.output, "w", encoding="utf-8") as f:
         f.write("# Show | SxxEyy | Episode title | show IMDb ID | show TVDB ID\n" + "\n".join(rows) + "\n")
     with open(a.output + ".unmatched.txt", "w", encoding="utf-8") as f:
         f.write("# Show not found on TVMaze\n" + "\n".join(missed_show) + "\n\n# Show found, episode title not matched\n" + "\n".join(missed_ep) + "\n")
-    print("Resolved %d of %d lines. %d shows not found, %d episodes not matched (see %s.unmatched.txt)." % (len(rows), len(entries), len(missed_show), len(missed_ep), a.output))
+    print("Resolved %d of %d lines. %d lines for shows not found, %d episodes not matched (see %s.unmatched.txt)." % (len(rows), len(entries), len(missed_show), len(missed_ep), a.output))
 
 
 def read_resolved(path):
